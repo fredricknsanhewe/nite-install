@@ -52,6 +52,8 @@ php install --downgrade=v1.0.0
 - `releases/vX.Y.Z/release.json`
   Metadata for that package, including the checksum used by the installer.
 
+The release package includes Nite's runtime source layers such as controllers, routes, services, models, starter docs, sample definitions, and runnable example assets so downstream developers can learn from the framework in-place after installation.
+
 ## Repository
 
 - Public install repository: https://github.com/fredricknsanhewe/nite-install
