@@ -1,0 +1,996 @@
+#!/usr/bin/env php
+<?php
+
+const NITE_INSTALL_REPOSITORY = 'fredricknsanhewe/nite-install';
+const NITE_INSTALL_REF = 'main';
+const NITE_INSTALL_RAW_URL = 'https://raw.githubusercontent.com/fredricknsanhewe/nite-install/main';
+const NITE_INSTALL_LATEST_INDEX = 'latest.json';
+
+exit(niteInstallMain($argv));
+
+/**
+ * @param array<int, string> $argv
+ */
+function niteInstallMain(array $argv): int
+{
+    $rootPath = __DIR__;
+    $options = niteInstallParseOptions($argv);
+
+    if ($options['help']) {
+        niteInstallUsage();
+        return 0;
+    }
+
+    try {
+        if (niteInstallHasManagedApp($rootPath) && niteInstallHasComposerAutoload($rootPath)) {
+            return niteInstallDelegateToConsole($rootPath, $options);
+        }
+
+        $repository = niteInstallRepository();
+        $index = niteInstallLoadLatestIndex($rootPath, $repository);
+        $tag = niteInstallResolveRequestedTag($options, $index);
+        $release = niteInstallLoadReleaseManifest($rootPath, $repository, $tag);
+        $result = niteInstallSyncRelease($rootPath, $repository, $release, $options);
+
+        niteInstallWriteLine('Installed ' . $result['tag'] . ' into ' . $rootPath . '.');
+        niteInstallWriteLine('Managed files: ' . count($result['installed_files']) . '.');
+        if ($result['backup_dir'] !== null) {
+            niteInstallWriteLine('Backup: ' . $result['backup_dir']);
+        }
+        foreach ($result['notes'] as $note) {
+            niteInstallWriteLine($note);
+        }
+
+        return 0;
+    } catch (Throwable $e) {
+        fwrite(STDERR, 'Nite install failed: ' . $e->getMessage() . PHP_EOL);
+        return 1;
+    }
+}
+
+function niteInstallUsage(): void
+{
+    niteInstallWriteLine('Usage: php install [--version=v1.2.0] [--upgrade] [--downgrade=v1.0.0] [--force]');
+    niteInstallWriteLine('       php install --help');
+}
+
+/**
+ * @param array<int, string> $argv
+ * @return array<string, mixed>
+ */
+function niteInstallParseOptions(array $argv): array
+{
+    $options = [
+        'version' => null,
+        'upgrade' => false,
+        'downgrade' => null,
+        'force' => false,
+        'accept_conflicts' => false,
+        'backup' => true,
+        'composer' => true,
+        'accept_compatibility' => false,
+        'help' => false,
+    ];
+
+    foreach ($argv as $argument) {
+        if (str_starts_with($argument, '--version=')) {
+            $options['version'] = substr($argument, 10);
+            continue;
+        }
+
+        if ($argument === '--upgrade') {
+            $options['upgrade'] = true;
+            continue;
+        }
+
+        if (str_starts_with($argument, '--downgrade=')) {
+            $options['downgrade'] = substr($argument, 12);
+            continue;
+        }
+
+        if ($argument === '--force') {
+            $options['force'] = true;
+            continue;
+        }
+
+        if ($argument === '--accept-conflicts') {
+            $options['accept_conflicts'] = true;
+            continue;
+        }
+
+        if ($argument === '--no-backup') {
+            $options['backup'] = false;
+            continue;
+        }
+
+        if ($argument === '--no-composer') {
+            $options['composer'] = false;
+            continue;
+        }
+
+        if ($argument === '--accept-compatibility') {
+            $options['accept_compatibility'] = true;
+            continue;
+        }
+
+        if ($argument === '--help' || $argument === '-h') {
+            $options['help'] = true;
+        }
+    }
+
+    return $options;
+}
+
+/**
+ * @return array<string, string>
+ */
+function niteInstallRepository(): array
+{
+    $slug = trim((string)getenv('NITE_PUBLIC_REPOSITORY'));
+    $ref = trim((string)getenv('NITE_PUBLIC_REPOSITORY_REF'));
+    $raw = trim((string)getenv('NITE_PUBLIC_REPOSITORY_RAW_URL'));
+
+    $slug = $slug === '' ? NITE_INSTALL_REPOSITORY : $slug;
+    $ref = $ref === '' ? NITE_INSTALL_REF : $ref;
+    $raw = $raw === '' ? ('https://raw.githubusercontent.com/' . $slug . '/' . $ref) : rtrim($raw, '/');
+
+    return [
+        'slug' => $slug,
+        'ref' => $ref,
+        'raw' => $raw,
+    ];
+}
+
+function niteInstallHasManagedApp(string $rootPath): bool
+{
+    return is_file($rootPath . '/nite.php') && is_file($rootPath . '/src/Config/App.php');
+}
+
+function niteInstallHasComposerAutoload(string $rootPath): bool
+{
+    return is_file($rootPath . '/vendor/autoload.php');
+}
+
+/**
+ * @param array<string, mixed> $options
+ */
+function niteInstallDelegateToConsole(string $rootPath, array $options): int
+{
+    $command = [PHP_BINARY, 'nite.php'];
+    $targetVersion = niteInstallNormalizeVersion((string)($options['version'] ?? ''));
+    $downgradeTarget = niteInstallNormalizeVersion((string)($options['downgrade'] ?? ''));
+    $currentVersion = niteInstallCurrentVersion($rootPath);
+
+    if ($downgradeTarget !== '') {
+        $command[] = 'app:downgrade';
+        $command[] = $downgradeTarget;
+    } elseif ((bool)$options['upgrade']) {
+        if ($targetVersion !== '') {
+            $command[] = 'app:upgrade';
+            $command[] = $targetVersion;
+        } else {
+            $command[] = 'app:update';
+        }
+    } elseif ($targetVersion !== '') {
+        if ($currentVersion !== '' && version_compare($targetVersion, $currentVersion, '<')) {
+            $command[] = 'app:downgrade';
+            $command[] = $targetVersion;
+        } elseif ($currentVersion !== '' && version_compare($targetVersion, $currentVersion, '>')) {
+            $command[] = 'app:upgrade';
+            $command[] = $targetVersion;
+        } else {
+            $command[] = 'app:update';
+            $command[] = $targetVersion;
+        }
+    } else {
+        $command[] = 'app:update';
+    }
+
+    if ((bool)$options['force']) {
+        $command[] = '--force';
+    }
+    if ((bool)$options['accept_conflicts']) {
+        $command[] = '--accept-conflicts';
+    }
+    if (!(bool)$options['backup']) {
+        $command[] = '--no-backup';
+    }
+    if ((bool)$options['accept_compatibility']) {
+        $command[] = '--accept-compatibility';
+    }
+
+    niteInstallWriteLine('Delegating to `php nite ' . implode(' ', array_slice($command, 2)) . '`.');
+
+    $previous = getcwd();
+    if ($previous === false || !@chdir($rootPath)) {
+        throw new RuntimeException('Failed to enter the application directory before delegating to the console.');
+    }
+
+    try {
+        $escaped = array_map('escapeshellarg', $command);
+        passthru(implode(' ', $escaped), $exitCode);
+    } finally {
+        @chdir($previous ?: $rootPath);
+    }
+
+    return (int)($exitCode ?? 0);
+}
+
+/**
+ * @param array<string, string> $repository
+ * @return array<string, mixed>
+ */
+function niteInstallLoadLatestIndex(string $rootPath, array $repository): array
+{
+    $localPath = $rootPath . '/' . NITE_INSTALL_LATEST_INDEX;
+    if (is_file($localPath)) {
+        $payload = niteInstallDecodeJsonFile($localPath);
+        if ($payload !== []) {
+            return niteInstallNormalizeLatestIndex($payload);
+        }
+    }
+
+    $payload = niteInstallDecodeJsonString(niteInstallHttpGet($repository['raw'] . '/' . NITE_INSTALL_LATEST_INDEX));
+    return niteInstallNormalizeLatestIndex($payload);
+}
+
+/**
+ * @param array<string, mixed> $payload
+ * @return array<string, mixed>
+ */
+function niteInstallNormalizeLatestIndex(array $payload): array
+{
+    $versions = [];
+    foreach (array_values(is_array($payload['versions'] ?? null) ? $payload['versions'] : []) as $tag) {
+        $resolved = niteInstallNormalizeTag((string)$tag);
+        if ($resolved === '') {
+            continue;
+        }
+        $versions[$resolved] = true;
+    }
+
+    $tags = array_keys($versions);
+    usort($tags, static function (string $left, string $right): int {
+        return version_compare(niteInstallNormalizeVersion($left), niteInstallNormalizeVersion($right));
+    });
+
+    $latest = niteInstallNormalizeTag((string)($payload['latest'] ?? ''));
+    if ($latest === '' && $tags !== []) {
+        $latest = $tags[count($tags) - 1];
+    }
+
+    if ($latest === '' || $tags === []) {
+        throw new RuntimeException('The public latest.json index did not contain any installable versions.');
+    }
+
+    return [
+        'latest' => $latest,
+        'versions' => $tags,
+    ];
+}
+
+/**
+ * @param array<string, mixed> $options
+ * @param array<string, mixed> $index
+ */
+function niteInstallResolveRequestedTag(array $options, array $index): string
+{
+    $requested = '';
+
+    if (trim((string)($options['downgrade'] ?? '')) !== '') {
+        $requested = (string)$options['downgrade'];
+    } elseif (trim((string)($options['version'] ?? '')) !== '') {
+        $requested = (string)$options['version'];
+    } else {
+        $requested = (string)$index['latest'];
+    }
+
+    $tag = niteInstallNormalizeTag($requested);
+    $versions = array_values(is_array($index['versions'] ?? null) ? $index['versions'] : []);
+    if (!in_array($tag, $versions, true)) {
+        throw new RuntimeException('Requested version ' . $tag . ' was not found. Available versions: ' . implode(', ', $versions));
+    }
+
+    return $tag;
+}
+
+/**
+ * @param array<string, string> $repository
+ * @return array<string, mixed>
+ */
+function niteInstallLoadReleaseManifest(string $rootPath, array $repository, string $tag): array
+{
+    $relativePath = 'releases/' . $tag . '/release.json';
+    $localPath = $rootPath . '/' . $relativePath;
+    if (is_file($localPath)) {
+        $payload = niteInstallDecodeJsonFile($localPath);
+        if ($payload !== []) {
+            return niteInstallNormalizeReleaseManifest($payload, $tag, $repository);
+        }
+    }
+
+    $payload = niteInstallDecodeJsonString(niteInstallHttpGet($repository['raw'] . '/' . $relativePath));
+    return niteInstallNormalizeReleaseManifest($payload, $tag, $repository);
+}
+
+/**
+ * @param array<string, mixed> $payload
+ * @param array<string, string> $repository
+ * @return array<string, mixed>
+ */
+function niteInstallNormalizeReleaseManifest(array $payload, string $tag, array $repository): array
+{
+    $resolvedTag = niteInstallNormalizeTag((string)($payload['tag'] ?? $tag));
+    $package = trim((string)($payload['package'] ?? ('releases/' . $resolvedTag . '/package.zip')));
+    $packageUrl = str_starts_with($package, 'http://') || str_starts_with($package, 'https://')
+        ? $package
+        : $repository['raw'] . '/' . ltrim($package, '/');
+
+    return [
+        'tag' => $resolvedTag,
+        'version' => niteInstallNormalizeVersion((string)($payload['version'] ?? $resolvedTag)),
+        'package' => $package,
+        'package_url' => $packageUrl,
+        'package_sha256' => strtolower(trim((string)($payload['package_sha256'] ?? ''))),
+        'required_directories' => array_values(is_array($payload['required_directories'] ?? null) ? $payload['required_directories'] : []),
+    ];
+}
+
+/**
+ * @param array<string, string> $repository
+ * @param array<string, mixed> $release
+ * @param array<string, mixed> $options
+ * @return array<string, mixed>
+ */
+function niteInstallSyncRelease(string $rootPath, array $repository, array $release, array $options): array
+{
+    niteInstallAssertWorkspaceReady($rootPath, (bool)$options['force'], (bool)$options['accept_conflicts']);
+
+    $tempRoot = $rootPath . '/storage/console/tmp/install_' . gmdate('YmdHis') . '_' . bin2hex(random_bytes(4));
+    $packagePath = $tempRoot . '/package.zip';
+    $extractPath = $tempRoot . '/extract';
+    niteInstallEnsureDirectory($extractPath);
+
+    try {
+        $localPackage = $rootPath . '/' . str_replace('/', DIRECTORY_SEPARATOR, (string)$release['package']);
+        if (is_file($localPackage)) {
+            if (!@copy($localPackage, $packagePath)) {
+                throw new RuntimeException('Failed to copy the local package for ' . $release['tag'] . '.');
+            }
+        } else {
+            niteInstallDownloadFile((string)$release['package_url'], $packagePath);
+        }
+
+        niteInstallVerifyChecksum($packagePath, (string)$release['package_sha256']);
+        $releaseRoot = niteInstallExtractZip($packagePath, $extractPath);
+        $releaseFiles = niteInstallCollectReleaseFiles($releaseRoot);
+        if ($releaseFiles === []) {
+            throw new RuntimeException('The selected public package did not contain any installable files.');
+        }
+
+        $manifest = niteInstallReadVersionManifest($rootPath);
+        $previousFiles = array_values(is_array($manifest['installed_files'] ?? null) ? $manifest['installed_files'] : []);
+        $backupDir = (bool)$options['backup']
+            ? $rootPath . '/storage/console/backups/' . gmdate('YmdHis') . '_' . (string)$release['tag']
+            : null;
+
+        $conflicts = niteInstallConflictingFiles($rootPath, $releaseFiles, $previousFiles);
+        if ($conflicts !== []) {
+            if ((bool)$options['force']) {
+                // Continue without prompting.
+            } elseif (niteInstallIsInteractive()) {
+                niteInstallWriteLine('The following files will be overwritten:');
+                foreach ($conflicts as $path) {
+                    niteInstallWriteLine('  - ' . $path);
+                }
+                if (!niteInstallConfirm('Continue? [y/N] ')) {
+                    throw new RuntimeException('Installation cancelled.');
+                }
+            } else {
+                throw new RuntimeException('Existing project files would be overwritten. Re-run with --force after you review the workspace.');
+            }
+        }
+
+        $removed = niteInstallRemoveStaleFiles($rootPath, $previousFiles, $releaseFiles, $backupDir);
+        $written = niteInstallWriteReleaseFiles($rootPath, $releaseFiles, $backupDir);
+        niteInstallEnsureManagedDirectories($rootPath, array_values((array)$release['required_directories']));
+
+        $notes = [];
+        if (!is_file($rootPath . '/.env') && is_file($rootPath . '/.env.example')) {
+            if (@copy($rootPath . '/.env.example', $rootPath . '/.env')) {
+                $notes[] = 'Created .env from .env.example.';
+            }
+        }
+        if (!is_file($rootPath . '/.env.docker') && is_file($rootPath . '/.env.docker.example')) {
+            if (@copy($rootPath . '/.env.docker.example', $rootPath . '/.env.docker')) {
+                $notes[] = 'Created .env.docker from .env.docker.example.';
+            }
+        }
+
+        $composerState = niteInstallMaybeRunComposer($rootPath, (bool)$options['composer']);
+        if ($composerState !== '') {
+            $notes[] = $composerState;
+        }
+
+        niteInstallWriteVersionManifest($rootPath, $release, array_keys($releaseFiles), $repository);
+
+        return [
+            'tag' => (string)$release['tag'],
+            'version' => (string)$release['version'],
+            'written' => $written,
+            'removed' => $removed,
+            'backup_dir' => $backupDir,
+            'installed_files' => array_keys($releaseFiles),
+            'notes' => $notes,
+        ];
+    } finally {
+        niteInstallDeleteDirectory($tempRoot);
+    }
+}
+
+function niteInstallAssertWorkspaceReady(string $rootPath, bool $force, bool $acceptConflicts): void
+{
+    if ($force || $acceptConflicts || !is_dir($rootPath . '/.git')) {
+        return;
+    }
+
+    $output = [];
+    $code = 0;
+    $command = 'git -C ' . escapeshellarg($rootPath) . ' status --porcelain --untracked-files=no';
+    @exec($command, $output, $code);
+    if ($code === 0 && trim(implode("\n", $output)) !== '') {
+        throw new RuntimeException('The working tree has local changes. Commit or stash them, or re-run with --accept-conflicts or --force.');
+    }
+}
+
+function niteInstallExtractZip(string $archivePath, string $extractPath): string
+{
+    $zip = new ZipArchive();
+    if ($zip->open($archivePath) !== true) {
+        throw new RuntimeException('Failed to open the downloaded release package.');
+    }
+
+    if (!$zip->extractTo($extractPath)) {
+        $zip->close();
+        throw new RuntimeException('Failed to extract the downloaded release package.');
+    }
+    $zip->close();
+
+    $entries = array_values(array_filter(
+        glob($extractPath . '/*') ?: [],
+        static fn (string $path): bool => is_dir($path)
+    ));
+
+    if ($entries === []) {
+        return $extractPath;
+    }
+
+    if (count($entries) === 1 && !is_file($extractPath . '/composer.json')) {
+        return $entries[0];
+    }
+
+    return $extractPath;
+}
+
+/**
+ * @return array<string, string>
+ */
+function niteInstallCollectReleaseFiles(string $releaseRoot): array
+{
+    $files = [];
+    $iterator = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator($releaseRoot, FilesystemIterator::SKIP_DOTS)
+    );
+
+    foreach ($iterator as $item) {
+        if (!$item->isFile()) {
+            continue;
+        }
+
+        $absolute = $item->getPathname();
+        $relative = str_replace('\\', '/', substr($absolute, strlen($releaseRoot) + 1));
+        if ($relative === '' || niteInstallProtectedPath($relative)) {
+            continue;
+        }
+
+        $files[$relative] = $absolute;
+    }
+
+    ksort($files);
+    return $files;
+}
+
+/**
+ * @param array<string, string> $releaseFiles
+ * @param array<int, string> $previousFiles
+ * @return array<int, string>
+ */
+function niteInstallConflictingFiles(string $rootPath, array $releaseFiles, array $previousFiles): array
+{
+    $managed = array_fill_keys(array_map('strval', $previousFiles), true);
+    $conflicts = [];
+
+    foreach ($releaseFiles as $relative => $source) {
+        $destination = $rootPath . '/' . str_replace('/', DIRECTORY_SEPARATOR, $relative);
+        if (!is_file($destination)) {
+            continue;
+        }
+
+        $existing = file_get_contents($destination);
+        $incoming = file_get_contents($source);
+        if (!is_string($existing) || !is_string($incoming) || $existing === $incoming) {
+            continue;
+        }
+
+        if (isset($managed[$relative])) {
+            continue;
+        }
+
+        $conflicts[] = $relative;
+    }
+
+    sort($conflicts);
+    return $conflicts;
+}
+
+/**
+ * @param array<int, string> $previousFiles
+ * @param array<string, string> $releaseFiles
+ * @return array<int, string>
+ */
+function niteInstallRemoveStaleFiles(string $rootPath, array $previousFiles, array $releaseFiles, ?string $backupDir): array
+{
+    $releaseLookup = array_fill_keys(array_keys($releaseFiles), true);
+    $removed = [];
+
+    foreach ($previousFiles as $relative) {
+        $normalized = str_replace('\\', '/', trim((string)$relative));
+        if ($normalized === '' || isset($releaseLookup[$normalized]) || niteInstallProtectedPath($normalized)) {
+            continue;
+        }
+
+        $absolute = $rootPath . '/' . str_replace('/', DIRECTORY_SEPARATOR, $normalized);
+        if (!is_file($absolute)) {
+            continue;
+        }
+
+        if ($backupDir !== null) {
+            niteInstallBackupFile($absolute, $normalized, $backupDir);
+        }
+
+        if (!@unlink($absolute)) {
+            throw new RuntimeException('Failed to remove stale managed file ' . $normalized . '.');
+        }
+        $removed[] = $absolute;
+    }
+
+    return $removed;
+}
+
+/**
+ * @param array<string, string> $releaseFiles
+ * @return array<int, string>
+ */
+function niteInstallWriteReleaseFiles(string $rootPath, array $releaseFiles, ?string $backupDir): array
+{
+    $written = [];
+
+    foreach ($releaseFiles as $relative => $source) {
+        $destination = $rootPath . '/' . str_replace('/', DIRECTORY_SEPARATOR, $relative);
+        niteInstallEnsureDirectory(dirname($destination));
+
+        $incoming = file_get_contents($source);
+        if (!is_string($incoming)) {
+            throw new RuntimeException('Failed to read the release file ' . $relative . '.');
+        }
+
+        $existing = is_file($destination) ? file_get_contents($destination) : null;
+        if ($existing === $incoming) {
+            continue;
+        }
+
+        if ($backupDir !== null && is_file($destination)) {
+            niteInstallBackupFile($destination, $relative, $backupDir);
+        }
+
+        if (file_put_contents($destination, $incoming) === false) {
+            throw new RuntimeException('Failed to write ' . $relative . '.');
+        }
+
+        $written[] = $destination;
+    }
+
+    return $written;
+}
+
+/**
+ * @param array<int, string> $directories
+ */
+function niteInstallEnsureManagedDirectories(string $rootPath, array $directories): void
+{
+    $defaults = [
+        'blueprints/resources',
+        'blueprints/starters/apps',
+        'blueprints/starters/generated',
+        'blueprints/starters/samples',
+        'projects',
+        'public/uploads',
+        'routes/generated',
+        'storage',
+        'storage/console',
+        'storage/console/backups',
+        'storage/console/tmp',
+    ];
+
+    foreach (array_unique(array_merge($defaults, array_map('strval', $directories))) as $directory) {
+        if (trim($directory) === '') {
+            continue;
+        }
+        niteInstallEnsureDirectory($rootPath . '/' . str_replace('/', DIRECTORY_SEPARATOR, $directory));
+    }
+}
+
+function niteInstallProtectedPath(string $relativePath): bool
+{
+    $normalized = trim(str_replace('\\', '/', $relativePath), '/');
+    if ($normalized === '') {
+        return true;
+    }
+
+    if (in_array($normalized, ['.env', '.env.docker'], true)) {
+        return true;
+    }
+
+    if (preg_match('#^projects/[^/]+/\.env(\.docker)?$#', $normalized) === 1) {
+        return true;
+    }
+
+    foreach (['.git/', 'storage/', 'public/uploads/', 'routes/generated/'] as $prefix) {
+        if (str_starts_with($normalized . '/', $prefix)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+function niteInstallCurrentVersion(string $rootPath): string
+{
+    $manifest = niteInstallReadVersionManifest($rootPath);
+    $current = niteInstallNormalizeVersion((string)($manifest['current_version'] ?? ''));
+    if ($current !== '') {
+        return $current;
+    }
+
+    $appPath = $rootPath . '/src/Config/App.php';
+    if (!is_file($appPath)) {
+        return '';
+    }
+
+    $contents = file_get_contents($appPath);
+    if (!is_string($contents)) {
+        return '';
+    }
+
+    if (preg_match("/VERSION = '([^']+)'/", $contents, $matches) === 1) {
+        return niteInstallNormalizeVersion((string)($matches[1] ?? ''));
+    }
+
+    return '';
+}
+
+/**
+ * @return array<string, mixed>
+ */
+function niteInstallReadVersionManifest(string $rootPath): array
+{
+    $path = $rootPath . '/storage/console/version.json';
+    if (!is_file($path)) {
+        return [];
+    }
+
+    return niteInstallDecodeJsonFile($path);
+}
+
+/**
+ * @param array<int, string> $installedFiles
+ * @param array<string, string> $repository
+ */
+function niteInstallWriteVersionManifest(string $rootPath, array $release, array $installedFiles, array $repository): void
+{
+    $path = $rootPath . '/storage/console/version.json';
+    niteInstallEnsureDirectory(dirname($path));
+
+    $existing = niteInstallReadVersionManifest($rootPath);
+    $history = array_values(is_array($existing['history'] ?? null) ? $existing['history'] : []);
+    $history[] = [
+        'action' => 'install',
+        'from' => (string)($existing['current_version'] ?? ''),
+        'to' => (string)($release['version'] ?? ''),
+        'at' => gmdate('c'),
+        'meta' => [
+            'installed_tag' => (string)($release['tag'] ?? ''),
+            'repository' => $repository,
+        ],
+    ];
+
+    $payload = [
+        'application' => 'Nite',
+        'current_version' => (string)($release['version'] ?? ''),
+        'installed_tag' => (string)($release['tag'] ?? ''),
+        'repository' => [
+            'slug' => $repository['slug'],
+            'url' => 'https://github.com/' . $repository['slug'],
+            'api' => 'https://api.github.com/repos/' . $repository['slug'],
+            'ref' => $repository['ref'],
+            'raw' => $repository['raw'],
+        ],
+        'installed_files' => array_values(array_map('strval', $installedFiles)),
+        'history' => $history,
+        'updated_at' => gmdate('c'),
+    ];
+
+    $encoded = json_encode($payload, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE);
+    if (!is_string($encoded) || file_put_contents($path, $encoded . PHP_EOL) === false) {
+        throw new RuntimeException('Failed to write the local version manifest.');
+    }
+}
+
+function niteInstallMaybeRunComposer(string $rootPath, bool $enabled): string
+{
+    if (!$enabled || !is_file($rootPath . '/composer.json')) {
+        return '';
+    }
+
+    $composer = niteInstallFindComposerCommand($rootPath);
+    if ($composer === null) {
+        return 'Composer was not found on PATH. Run `composer install` before you start Nite.';
+    }
+
+    $previous = getcwd();
+    if ($previous === false || !@chdir($rootPath)) {
+        return 'Installed the release, but failed to enter the project directory for Composer.';
+    }
+
+    try {
+        passthru($composer . ' install --no-interaction --prefer-dist', $exitCode);
+    } finally {
+        @chdir($previous ?: $rootPath);
+    }
+
+    return (int)($exitCode ?? 1) === 0
+        ? 'Composer dependencies installed.'
+        : 'Release files were installed, but `composer install` failed. Run it manually before you start Nite.';
+}
+
+function niteInstallFindComposerCommand(string $rootPath): ?string
+{
+    $localPhar = $rootPath . '/composer.phar';
+    if (is_file($localPhar)) {
+        return escapeshellarg(PHP_BINARY) . ' ' . escapeshellarg($localPhar);
+    }
+
+    $commands = strtoupper(substr(PHP_OS, 0, 3)) === 'WIN'
+        ? ['composer.bat', 'composer.cmd', 'composer']
+        : ['composer'];
+
+    foreach ($commands as $candidate) {
+        $output = [];
+        $code = 0;
+        @exec($candidate . ' --version', $output, $code);
+        if ($code === 0) {
+            return $candidate;
+        }
+    }
+
+    return null;
+}
+
+function niteInstallDownloadFile(string $url, string $destination): void
+{
+    niteInstallEnsureDirectory(dirname($destination));
+
+    if (function_exists('curl_init')) {
+        $headers = ['User-Agent: Nite Installer'];
+        $handle = curl_init($url);
+        if ($handle === false) {
+            throw new RuntimeException('Failed to initialize the installer HTTP client.');
+        }
+
+        $stream = fopen($destination, 'wb');
+        if ($stream === false) {
+            curl_close($handle);
+            throw new RuntimeException('Failed to create the local package destination.');
+        }
+
+        curl_setopt_array($handle, [
+            CURLOPT_FILE => $stream,
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_CONNECTTIMEOUT => 10,
+            CURLOPT_TIMEOUT => 300,
+            CURLOPT_HTTPHEADER => $headers,
+        ]);
+
+        $ok = curl_exec($handle);
+        $status = (int)curl_getinfo($handle, CURLINFO_RESPONSE_CODE);
+        $error = curl_error($handle);
+        fclose($stream);
+        curl_close($handle);
+
+        if ($ok === false || $status >= 400 || !is_file($destination) || filesize($destination) === 0) {
+            throw new RuntimeException($error !== '' ? $error : ('Package download failed with HTTP ' . $status . '.'));
+        }
+
+        return;
+    }
+
+    $body = niteInstallHttpGet($url);
+    if (file_put_contents($destination, $body) === false) {
+        throw new RuntimeException('Failed to save the downloaded package.');
+    }
+}
+
+function niteInstallVerifyChecksum(string $path, string $expectedHash): void
+{
+    if ($expectedHash === '') {
+        return;
+    }
+
+    $actual = hash_file('sha256', $path);
+    if (!is_string($actual) || strtolower($actual) !== strtolower($expectedHash)) {
+        throw new RuntimeException('The downloaded package failed checksum verification.');
+    }
+}
+
+function niteInstallBackupFile(string $absolutePath, string $relativePath, string $backupDir): void
+{
+    $backupPath = $backupDir . '/' . str_replace('/', DIRECTORY_SEPARATOR, $relativePath);
+    niteInstallEnsureDirectory(dirname($backupPath));
+    if (!@copy($absolutePath, $backupPath)) {
+        throw new RuntimeException('Failed to create a backup for ' . $relativePath . '.');
+    }
+}
+
+function niteInstallDeleteDirectory(string $path): void
+{
+    if (!is_dir($path)) {
+        return;
+    }
+
+    $iterator = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator($path, FilesystemIterator::SKIP_DOTS),
+        RecursiveIteratorIterator::CHILD_FIRST
+    );
+
+    foreach ($iterator as $item) {
+        if ($item->isDir()) {
+            @rmdir($item->getPathname());
+            continue;
+        }
+        @unlink($item->getPathname());
+    }
+
+    @rmdir($path);
+}
+
+function niteInstallEnsureDirectory(string $path): void
+{
+    if (is_dir($path)) {
+        return;
+    }
+
+    if (!@mkdir($path, 0777, true) && !is_dir($path)) {
+        throw new RuntimeException('Failed to create directory ' . $path . '.');
+    }
+}
+
+/**
+ * @return array<string, mixed>
+ */
+function niteInstallDecodeJsonFile(string $path): array
+{
+    $json = file_get_contents($path);
+    if (!is_string($json) || trim($json) === '') {
+        return [];
+    }
+
+    return niteInstallDecodeJsonString($json);
+}
+
+/**
+ * @return array<string, mixed>
+ */
+function niteInstallDecodeJsonString(string $json): array
+{
+    $decoded = json_decode($json, true);
+    if (!is_array($decoded)) {
+        throw new RuntimeException('Received invalid JSON while resolving the public release metadata.');
+    }
+
+    return $decoded;
+}
+
+function niteInstallHttpGet(string $url): string
+{
+    if (function_exists('curl_init')) {
+        $headers = ['User-Agent: Nite Installer'];
+        $handle = curl_init($url);
+        if ($handle === false) {
+            throw new RuntimeException('Failed to initialize the installer HTTP client.');
+        }
+
+        curl_setopt_array($handle, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_CONNECTTIMEOUT => 10,
+            CURLOPT_TIMEOUT => 120,
+            CURLOPT_HTTPHEADER => $headers,
+        ]);
+
+        $body = curl_exec($handle);
+        $status = (int)curl_getinfo($handle, CURLINFO_RESPONSE_CODE);
+        $error = curl_error($handle);
+        curl_close($handle);
+
+        if (!is_string($body) || $body === '' || $status >= 400) {
+            throw new RuntimeException($error !== '' ? $error : ('Metadata request failed with HTTP ' . $status . '.'));
+        }
+
+        return $body;
+    }
+
+    $context = stream_context_create([
+        'http' => [
+            'method' => 'GET',
+            'header' => 'User-Agent: Nite Installer',
+            'ignore_errors' => true,
+            'timeout' => 120,
+        ],
+    ]);
+
+    $body = @file_get_contents($url, false, $context);
+    if (!is_string($body) || $body === '') {
+        throw new RuntimeException('Metadata request failed for ' . $url . '.');
+    }
+
+    return $body;
+}
+
+function niteInstallNormalizeTag(string $value): string
+{
+    $version = niteInstallNormalizeVersion($value);
+    return $version === '' ? '' : 'v' . $version;
+}
+
+function niteInstallNormalizeVersion(string $value): string
+{
+    return ltrim(strtolower(trim($value)), 'v');
+}
+
+function niteInstallIsInteractive(): bool
+{
+    return PHP_SAPI === 'cli'
+        && function_exists('stream_isatty')
+        && defined('STDIN')
+        && stream_isatty(STDIN);
+}
+
+function niteInstallConfirm(string $prompt): bool
+{
+    if (!defined('STDIN')) {
+        return false;
+    }
+
+    fwrite(STDOUT, $prompt);
+    $answer = fgets(STDIN);
+    if (!is_string($answer)) {
+        return false;
+    }
+
+    return in_array(strtolower(trim($answer)), ['y', 'yes'], true);
+}
+
+function niteInstallWriteLine(string $message): void
+{
+    fwrite(STDOUT, $message . PHP_EOL);
+}
