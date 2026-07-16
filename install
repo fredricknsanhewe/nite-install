@@ -50,7 +50,7 @@ function niteInstallMain(array $argv): int
 
 function niteInstallUsage(): void
 {
-    niteInstallWriteLine('Usage: php install [--version=v1.2.0] [--upgrade] [--downgrade=v1.0.0] [--force]');
+    niteInstallWriteLine('Usage: php install [--version=v2.0.0-beta.1] [--upgrade] [--downgrade=v1.0.0] [--force]');
     niteInstallWriteLine('       php install --help');
 }
 

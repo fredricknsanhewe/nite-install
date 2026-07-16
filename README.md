@@ -15,7 +15,7 @@ Install an exact release:
 
 ```bash
 php install --version=v1.0.0
-php install --version=v1.2.0
+php install --version=v2.0.0-beta.1
 ```
 
 ## Upgrade
