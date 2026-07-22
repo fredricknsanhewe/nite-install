@@ -15,7 +15,7 @@ Install an exact release:
 
 ```bash
 php install --version=v1.0.0
-php install --version=v2.0.0-beta.1
+php install --version=v2.2.0
 ```
 
 ## Upgrade
@@ -25,6 +25,8 @@ From an existing Nite application directory:
 ```bash
 php install --upgrade
 ```
+
+Read the packaged `UPGRADE.md` before upgrading a production application.
 
 ## Downgrade
 
